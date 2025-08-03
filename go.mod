@@ -1,4 +1,4 @@
-module github.com/KoNekoD/rmqc
+module github.com/KoNekoD/go-rabbitmq-consumers
 
 go 1.23.6
 
