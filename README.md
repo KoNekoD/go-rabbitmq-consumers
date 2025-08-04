@@ -69,3 +69,22 @@ func (c *ExampleConsumer) Handle(job ExampleJob) error {
 	return nil
 }
 ```
+
+```go
+package main
+
+import (
+	"my_project/pkg/consumers"
+	"github.com/charmbracelet/log"
+)
+
+func main() {
+	consumer := consumers.NewExampleConsumer()
+
+	err := consumer.Init()
+	if err != nil {
+		log.Fatal("Example consumer error", "err", err)
+	}
+}
+
+```
