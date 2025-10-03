@@ -2,6 +2,8 @@ package rmqc
 
 import (
 	"encoding/json"
+	"sync"
+
 	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -48,6 +50,8 @@ type AbstractConsumer[JobType any] struct {
 
 	/** Handle Functions */
 	handleFunc func(JobType) error
+
+	stopNeeded chan struct{}
 }
 
 type NewOption[JobType any] func(*AbstractConsumer[JobType])
@@ -209,6 +213,7 @@ func NewAbstractConsumer[JobType any](
 		queueName:     queueName,
 		consumerTag:   queueName,
 		prefetchCount: 1,
+		stopNeeded:    make(chan struct{}, 1),
 	}
 
 	for _, option := range options {
@@ -232,6 +237,8 @@ func (c *AbstractConsumer[JobType]) SetHandleFunc(handleFunc func(JobType) error
 }
 
 type Consumer[JobType any] interface {
+	Init() error
+	Stop()
 	Handle(JobType) error
 }
 
@@ -306,7 +313,30 @@ func (c *AbstractConsumer[JobType]) Init() error {
 
 	var multiErr *multierror.Error
 
+	stopNeeded := false
+	mu := sync.Mutex{}
+	go func() {
+		<-c.stopNeeded
+
+		mu.Lock()
+
+		stopNeeded = true
+
+		err = channel.Cancel(c.consumerTag, false)
+		if err != nil {
+			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+		}
+
+		mu.Unlock()
+	}()
+
 	for msg := range delivery {
+		mu.Lock()
+
+		if stopNeeded {
+			break
+		}
+
 		var job JobType
 
 		err = json.Unmarshal(msg.Body, &job)
@@ -326,6 +356,8 @@ func (c *AbstractConsumer[JobType]) Init() error {
 			multiErr = multierror.Append(multiErr, errors.WithStack(err))
 			break
 		}
+
+		mu.Unlock()
 	}
 
 	err = channel.Cancel(c.consumerTag, false)
@@ -348,4 +380,8 @@ func (c *AbstractConsumer[JobType]) Init() error {
 	}
 
 	return nil
+}
+
+func (c *AbstractConsumer[JobType]) Stop() {
+	c.stopNeeded <- struct{}{}
 }
