@@ -1,8 +1,10 @@
 package rmqc
 
 import (
+	"context"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
@@ -52,6 +54,10 @@ type AbstractConsumer[JobType any] struct {
 	handleFunc func(JobType) error
 
 	stopNeeded chan struct{}
+
+	baseDelay      time.Duration
+	maxDelay       time.Duration
+	delayPublisher *DelayPublisher
 }
 
 type NewOption[JobType any] func(*AbstractConsumer[JobType])
@@ -207,13 +213,16 @@ func NewAbstractConsumer[JobType any](
 	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
 
 	c := AbstractConsumer[JobType]{
-		dsn:           cleanDsn,
-		exchangeName:  queueName,
-		exchangeKind:  ExchangeFanout,
-		queueName:     queueName,
-		consumerTag:   queueName,
-		prefetchCount: 1,
-		stopNeeded:    make(chan struct{}, 1),
+		dsn:            cleanDsn,
+		exchangeName:   queueName,
+		exchangeKind:   ExchangeFanout,
+		queueName:      queueName,
+		consumerTag:    queueName,
+		prefetchCount:  1,
+		stopNeeded:     make(chan struct{}, 1),
+		baseDelay:      5 * time.Second,
+		maxDelay:       10 * time.Minute,
+		delayPublisher: NewDelayPublisher(cleanDsn),
 	}
 
 	for _, option := range options {
@@ -348,6 +357,25 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		err = c.handleFunc(job)
 		if err != nil {
 			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+
+			ctx := context.Background()
+			attempt := getRetryAttempt(msg.Headers) + 1
+			h := setRetryAttempt(msg.Headers, attempt)
+			delayMs := int(exponentialBackoffDelay(attempt, c.baseDelay, c.maxDelay).Milliseconds())
+
+			pubErr := c.delayPublisher.PublishDelayedJSON(ctx, c.exchangeName, c.queueBindKey, job, delayMs, h)
+			if pubErr != nil {
+				multiErr = multierror.Append(multiErr, errors.WithStack(pubErr))
+				break
+			}
+
+			if ackErr := msg.Ack(false); ackErr != nil {
+				multiErr = multierror.Append(multiErr, errors.WithStack(ackErr))
+				break
+			}
+
+			mu.Unlock()
+
 			break
 		}
 
