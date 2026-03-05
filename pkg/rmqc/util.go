@@ -1,35 +1,32 @@
 package rmqc
 
 import (
-	amqp "github.com/rabbitmq/amqp091-go"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // unwrapQueueFromDSN Unwrap queue name from dsn
 //
 //	If dsn is "amqp://user:pass@localhost:5672/vhost/queueName"
-//	It will return dsn "amqp://user:pass@localhost:5672/vhost/" and queueName "queueName"
-func unwrapQueueFromDSN(dsn string) (cleanDsn, queueName string) {
+//	It will return dsn "amqp://user:pass@localhost:5672/vhost" and queueName "queueName"
+func unwrapQueueFromDSN(dsn string) (cleanDsn, queueName string, err error) {
 	splitDsn := strings.Split(dsn, "/")
-
-	newDsn := strings.Builder{}
-
-	for i, s := range splitDsn {
-		// If its last "five" element - it is queue name
-		if i == 4 && len(splitDsn) == 5 {
-			queueName = s
-			break
-		}
-
-		newDsn.WriteString(s)
-		newDsn.WriteString("/")
+	if len(splitDsn) != 5 {
+		return "", "", fmt.Errorf("rmqc: invalid DSN format: expected 5 path segments, got %d", len(splitDsn))
 	}
 
-	dsn = strings.TrimRight(newDsn.String(), "/")
+	queueName = splitDsn[4]
+	if queueName == "" {
+		return "", "", fmt.Errorf("rmqc: empty queue name in DSN")
+	}
 
-	return dsn, queueName
+	cleanDsn = strings.Join(splitDsn[:4], "/")
+
+	return cleanDsn, queueName, nil
 }
 
 const retryAttemptHeader = "x-retry-attempt"

@@ -1,9 +1,12 @@
 package rmqc
 
 import (
+	"context"
 	"encoding/json"
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
+	"errors"
+	"fmt"
+	"sync"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -32,6 +35,10 @@ type Pusher struct {
 	queueBindKey    string
 	queueBindNoWait bool
 	queueBindArgs   amqp.Table
+
+	mu   sync.Mutex
+	conn *amqp.Connection
+	ch   *amqp.Channel
 }
 
 type PusherOption func(*Pusher)
@@ -126,10 +133,13 @@ func WithPusherQueueBindArgs(queueBindArgs amqp.Table) PusherOption {
 	}
 }
 
-func NewPusher(dsn string, options ...PusherOption) Pusher {
-	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
+func NewPusher(dsn string, options ...PusherOption) (*Pusher, error) {
+	cleanDsn, queueName, err := unwrapQueueFromDSN(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("new pusher: %w", err)
+	}
 
-	c := Pusher{
+	c := &Pusher{
 		dsn:          cleanDsn,
 		exchangeName: queueName,
 		exchangeKind: ExchangeFanout,
@@ -137,24 +147,30 @@ func NewPusher(dsn string, options ...PusherOption) Pusher {
 	}
 
 	for _, option := range options {
-		option(&c)
+		option(c)
 	}
 
-	return c
+	return c, nil
 }
 
-func (c *Pusher) Push(job any) error {
-	connection, err := amqp.Dial(c.dsn)
+func (c *Pusher) ensureChannel() (*amqp.Channel, error) {
+	if c.conn != nil && !c.conn.IsClosed() && c.ch != nil {
+		return c.ch, nil
+	}
+	c.closeUnsafe()
+
+	conn, err := amqp.Dial(c.dsn)
 	if err != nil {
-		return errors.WithStack(err)
+		return nil, fmt.Errorf("dial: %w", err)
 	}
 
-	channel, err := connection.Channel()
+	ch, err := conn.Channel()
 	if err != nil {
-		return errors.WithStack(err)
+		_ = conn.Close()
+		return nil, fmt.Errorf("channel: %w", err)
 	}
 
-	err = channel.ExchangeDeclare(
+	if err := ch.ExchangeDeclare(
 		c.exchangeName,
 		string(c.exchangeKind),
 		c.exchangeDurable,
@@ -162,64 +178,98 @@ func (c *Pusher) Push(job any) error {
 		c.exchangeInternal,
 		c.exchangeNoWait,
 		c.exchangeArgs,
-	)
-	if err != nil {
-		return errors.WithStack(err)
+	); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("exchange declare: %w", err)
 	}
 
-	_, err = channel.QueueDeclare(
+	if _, err := ch.QueueDeclare(
 		c.queueName,
 		c.queueDurable,
 		c.queueAutoDelete,
 		c.queueExclusive,
 		c.queueNoWait,
 		c.queueArgs,
-	)
-	if err != nil {
-		return errors.WithStack(err)
+	); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("queue declare: %w", err)
 	}
 
-	err = channel.QueueBind(
+	if err := ch.QueueBind(
 		c.queueName,
 		c.queueBindKey,
 		c.exchangeName,
 		c.queueBindNoWait,
 		c.queueBindArgs,
+	); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("queue bind: %w", err)
+	}
+
+	c.conn = conn
+	c.ch = ch
+	return ch, nil
+}
+
+func (c *Pusher) closeUnsafe() {
+	if c.ch != nil {
+		_ = c.ch.Close()
+		c.ch = nil
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+}
+
+func (c *Pusher) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var errs []error
+	if c.ch != nil {
+		if err := c.ch.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		c.ch = nil
+	}
+	if c.conn != nil {
+		if err := c.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		c.conn = nil
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Pusher) Push(ctx context.Context, job any) error {
+	body, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ch, err := c.ensureChannel()
+	if err != nil {
+		return fmt.Errorf("ensure channel: %w", err)
+	}
+
+	err = ch.PublishWithContext(
+		ctx,
+		c.exchangeName,
+		c.queueBindKey,
+		false,
+		false,
+		amqp.Publishing{ContentType: JsonContentType, Body: body},
 	)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	var multiErr *multierror.Error
-
-	body, err := json.Marshal(job)
-	if err == nil {
-		err = channel.Publish(
-			c.exchangeName,
-			c.queueBindKey,
-			false,
-			false,
-			amqp.Publishing{ContentType: JsonContentType, Body: body},
-		)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-		}
-	} else {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = channel.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = connection.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	if multiErr != nil {
-		return errors.WithStack(multiErr)
+		c.closeUnsafe()
+		return fmt.Errorf("publish: %w", err)
 	}
 
 	return nil
