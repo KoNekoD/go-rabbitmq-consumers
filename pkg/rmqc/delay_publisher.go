@@ -5,11 +5,12 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -27,6 +28,10 @@ type DelayPublisher struct {
 
 	exchangeDurable bool
 	queueDurable    bool
+
+	mu   sync.Mutex
+	conn *amqp.Connection
+	ch   *amqp.Channel
 }
 
 type DelayPublisherOption func(*DelayPublisher)
@@ -81,6 +86,67 @@ func WithDelayQueueDurable(v bool) DelayPublisherOption {
 	return func(p *DelayPublisher) { p.queueDurable = v }
 }
 
+func (p *DelayPublisher) ensureChannel() (*amqp.Channel, error) {
+	if p.conn != nil && !p.conn.IsClosed() && p.ch != nil {
+		return p.ch, nil
+	}
+	p.closeUnsafe()
+
+	conn, err := amqp.Dial(p.dsn)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("channel: %w", err)
+	}
+
+	if err := ch.ExchangeDeclare(p.exchangeName, p.exchangeKind, p.exchangeDurable, false, false, false, p.exchangeArgs); err != nil {
+		_ = ch.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("exchange declare: %w", err)
+	}
+
+	p.conn = conn
+	p.ch = ch
+	return ch, nil
+}
+
+func (p *DelayPublisher) closeUnsafe() {
+	if p.ch != nil {
+		_ = p.ch.Close()
+		p.ch = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
+	}
+}
+
+func (p *DelayPublisher) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var errs []error
+	if p.ch != nil {
+		if err := p.ch.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		p.ch = nil
+	}
+	if p.conn != nil {
+		if err := p.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		p.conn = nil
+	}
+	return errors.Join(errs...)
+}
+
+const maxTTLMs = 1<<31 - 1
+
 func (p *DelayPublisher) PublishDelayedJSON(
 	ctx context.Context,
 	originalExchange string,
@@ -92,37 +158,38 @@ func (p *DelayPublisher) PublishDelayedJSON(
 	if delayMs < 0 {
 		delayMs = 0
 	}
+	if delayMs > maxTTLMs {
+		delayMs = maxTTLMs
+	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	conn, err := amqp.Dial(p.dsn)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer func() { _ = conn.Close() }()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	ch, err := conn.Channel()
+	ch, err := p.ensureChannel()
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer func() { _ = ch.Close() }()
-
-	err = ch.ExchangeDeclare(p.exchangeName, p.exchangeKind, p.exchangeDurable, false, false, false, p.exchangeArgs)
-	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("ensure channel: %w", err)
 	}
 
 	delayQueueName := p.makeDelayQueueName(originalExchange, originalRoutingKey, delayMs)
 	delayRoutingKey := delayQueueName
 
 	ttl := int32(delayMs)
-	expires := int32(delayMs + int(p.queueExpireGrace.Milliseconds()))
-	if expires < ttl+1000 {
-		expires = ttl + 1000
+	expiresMs := delayMs + int(p.queueExpireGrace.Milliseconds())
+	if expiresMs > maxTTLMs {
+		expiresMs = maxTTLMs
 	}
+	if int32(expiresMs) < ttl+1000 {
+		expiresMs = int(ttl) + 1000
+		if expiresMs > maxTTLMs {
+			expiresMs = maxTTLMs
+		}
+	}
+	expires := int32(expiresMs)
 
 	args := amqp.Table{
 		"x-message-ttl":             ttl,
@@ -136,19 +203,22 @@ func (p *DelayPublisher) PublishDelayedJSON(
 
 	_, err = ch.QueueDeclare(delayQueueName, p.queueDurable, false, false, false, args)
 	if err != nil {
-		return errors.WithStack(err)
+		p.closeUnsafe()
+		return fmt.Errorf("queue declare: %w", err)
 	}
 
 	err = ch.QueueBind(delayQueueName, delayRoutingKey, p.exchangeName, false, nil)
 	if err != nil {
-		return errors.WithStack(err)
+		p.closeUnsafe()
+		return fmt.Errorf("queue bind: %w", err)
 	}
 
 	pub := amqp.Publishing{ContentType: "application/json", Body: body, Headers: headers, Timestamp: time.Now()}
 
 	err = ch.PublishWithContext(ctx, p.exchangeName, delayRoutingKey, false, false, pub)
 	if err != nil {
-		return errors.WithStack(err)
+		p.closeUnsafe()
+		return fmt.Errorf("publish: %w", err)
 	}
 
 	return nil

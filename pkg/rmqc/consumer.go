@@ -3,11 +3,10 @@ package rmqc
 import (
 	"context"
 	"encoding/json"
-	"sync"
+	"fmt"
+	"log/slog"
 	"time"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -58,6 +57,8 @@ type AbstractConsumer[JobType any] struct {
 	baseDelay      time.Duration
 	maxDelay       time.Duration
 	delayPublisher *DelayPublisher
+
+	logger *slog.Logger
 }
 
 type NewOption[JobType any] func(*AbstractConsumer[JobType])
@@ -206,11 +207,20 @@ func WithQosGlobal[JobType any](qosGlobal bool) NewOption[JobType] {
 	}
 }
 
+func WithLogger[JobType any](logger *slog.Logger) NewOption[JobType] {
+	return func(c *AbstractConsumer[JobType]) {
+		c.logger = logger
+	}
+}
+
 func NewAbstractConsumer[JobType any](
 	dsn string,
 	options ...NewOption[JobType],
-) AbstractConsumer[JobType] {
-	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
+) (AbstractConsumer[JobType], error) {
+	cleanDsn, queueName, err := unwrapQueueFromDSN(dsn)
+	if err != nil {
+		return AbstractConsumer[JobType]{}, fmt.Errorf("new consumer: %w", err)
+	}
 
 	c := AbstractConsumer[JobType]{
 		dsn:            cleanDsn,
@@ -223,13 +233,14 @@ func NewAbstractConsumer[JobType any](
 		baseDelay:      5 * time.Second,
 		maxDelay:       10 * time.Minute,
 		delayPublisher: NewDelayPublisher(cleanDsn),
+		logger:         slog.Default(),
 	}
 
 	for _, option := range options {
 		option(&c)
 	}
 
-	return c
+	return c, nil
 }
 
 func SetupConsumerChild[JobType any, ChildType Consumer[JobType]](
@@ -254,13 +265,15 @@ type Consumer[JobType any] interface {
 func (c *AbstractConsumer[JobType]) Init() error {
 	connection, err := amqp.Dial(c.dsn)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("amqp dial: %w", err)
 	}
+	defer func() { _ = connection.Close() }()
 
 	channel, err := connection.Channel()
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("amqp channel: %w", err)
 	}
+	defer func() { _ = channel.Close() }()
 
 	err = channel.ExchangeDeclare(
 		c.exchangeName,
@@ -272,7 +285,7 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		c.exchangeArgs,
 	)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("exchange declare: %w", err)
 	}
 
 	_, err = channel.QueueDeclare(
@@ -284,7 +297,7 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		c.queueArgs,
 	)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("queue declare: %w", err)
 	}
 
 	err = channel.QueueBind(
@@ -295,7 +308,7 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		c.queueBindArgs,
 	)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("queue bind: %w", err)
 	}
 
 	err = channel.Qos(
@@ -304,7 +317,7 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		c.qosGlobal,
 	)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("qos: %w", err)
 	}
 
 	delivery, err := channel.Consume(
@@ -317,46 +330,31 @@ func (c *AbstractConsumer[JobType]) Init() error {
 		c.consumeArgs,
 	)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("consume: %w", err)
 	}
 
-	var multiErr *multierror.Error
+	done := make(chan struct{})
+	defer close(done)
 
-	stopNeeded := false
-	mu := sync.Mutex{}
 	go func() {
-		<-c.stopNeeded
-
-		mu.Lock()
-
-		stopNeeded = true
-
-		err = channel.Cancel(c.consumerTag, false)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+		select {
+		case <-c.stopNeeded:
+			_ = channel.Cancel(c.consumerTag, false)
+		case <-done:
 		}
-
-		mu.Unlock()
 	}()
 
 	for msg := range delivery {
-		mu.Lock()
-
-		if stopNeeded {
-			break
-		}
-
 		var job JobType
 
-		err = json.Unmarshal(msg.Body, &job)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-			break
+		if err := json.Unmarshal(msg.Body, &job); err != nil {
+			c.logger.Error("unmarshal failed", "queue", c.queueName, "error", err)
+			_ = msg.Nack(false, false)
+			continue
 		}
 
-		err = c.handleFunc(job)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+		if err := c.handleFunc(job); err != nil {
+			c.logger.Error("handle failed", "queue", c.queueName, "error", err)
 
 			ctx := context.Background()
 			attempt := getRetryAttempt(msg.Headers) + 1
@@ -365,46 +363,20 @@ func (c *AbstractConsumer[JobType]) Init() error {
 
 			pubErr := c.delayPublisher.PublishDelayedJSON(ctx, c.exchangeName, c.queueBindKey, job, delayMs, h)
 			if pubErr != nil {
-				multiErr = multierror.Append(multiErr, errors.WithStack(pubErr))
-				break
+				c.logger.Error("delay publish failed, requeuing", "queue", c.queueName, "error", pubErr)
+				_ = msg.Nack(false, true)
+				continue
 			}
 
 			if ackErr := msg.Ack(false); ackErr != nil {
-				multiErr = multierror.Append(multiErr, errors.WithStack(ackErr))
-				break
+				c.logger.Error("ack after retry failed", "queue", c.queueName, "error", ackErr)
 			}
-
-			mu.Unlock()
-
-			break
+			continue
 		}
 
-		err = msg.Ack(false)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-			break
+		if err := msg.Ack(false); err != nil {
+			c.logger.Error("ack failed", "queue", c.queueName, "error", err)
 		}
-
-		mu.Unlock()
-	}
-
-	err = channel.Cancel(c.consumerTag, false)
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = channel.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = connection.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	if multiErr != nil {
-		return errors.WithStack(multiErr)
 	}
 
 	return nil
