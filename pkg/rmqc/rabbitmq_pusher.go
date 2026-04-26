@@ -130,10 +130,12 @@ func NewPusher(dsn string, options ...PusherOption) Pusher {
 	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
 
 	c := Pusher{
-		dsn:          cleanDsn,
-		exchangeName: queueName,
-		exchangeKind: ExchangeFanout,
-		queueName:    queueName,
+		dsn:             cleanDsn,
+		exchangeName:    queueName,
+		exchangeKind:    ExchangeFanout,
+		queueName:       queueName,
+		exchangeDurable: true,
+		queueDurable:    true,
 	}
 
 	for _, option := range options {
