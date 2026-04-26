@@ -3,6 +3,7 @@ package rmqc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -208,25 +209,34 @@ func WithQosGlobal[JobType any](qosGlobal bool) NewOption[JobType] {
 
 func NewAbstractConsumer[JobType any](
 	dsn string,
-	options ...NewOption[JobType],
+	options ...any,
 ) AbstractConsumer[JobType] {
 	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
 
 	c := AbstractConsumer[JobType]{
-		dsn:            cleanDsn,
-		exchangeName:   queueName,
-		exchangeKind:   ExchangeFanout,
-		queueName:      queueName,
-		consumerTag:    queueName,
-		prefetchCount:  1,
-		stopNeeded:     make(chan struct{}, 1),
-		baseDelay:      5 * time.Second,
-		maxDelay:       10 * time.Minute,
-		delayPublisher: NewDelayPublisher(cleanDsn),
+		dsn:             cleanDsn,
+		exchangeName:    queueName,
+		exchangeKind:    ExchangeFanout,
+		queueName:       queueName,
+		consumerTag:     queueName,
+		prefetchCount:   1,
+		stopNeeded:      make(chan struct{}, 1),
+		baseDelay:       5 * time.Second,
+		maxDelay:        10 * time.Minute,
+		delayPublisher:  NewDelayPublisher(cleanDsn),
+		exchangeDurable: true,
+		queueDurable:    true,
 	}
 
 	for _, option := range options {
-		option(&c)
+		switch option := option.(type) {
+		case DelayPublisherOption:
+			option(c.delayPublisher)
+		case NewOption[JobType]:
+			option(&c)
+		default:
+			panic(fmt.Errorf("invalid option type: %T", option))
+		}
 	}
 
 	return c
