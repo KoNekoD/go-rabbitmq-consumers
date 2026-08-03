@@ -63,13 +63,13 @@ func getRetryAttempt(headers amqp.Table) int {
 }
 
 func headersWithRetryAttempt(original amqp.Table, attempt int) amqp.Table {
-	var headers amqp.Table
+	headers := make(amqp.Table, len(original)+1)
 
 	for k, v := range original {
 		headers[k] = v
 	}
 
-	headers[retryAttemptHeader] = attempt
+	headers[retryAttemptHeader] = int32(attempt)
 
 	return headers
 }

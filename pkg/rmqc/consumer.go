@@ -369,6 +369,12 @@ func (c *AbstractConsumer[JobType]) Run() error {
 		select {
 		case <-c.stopNeeded:
 			return nil
+		default:
+		}
+
+		select {
+		case <-c.stopNeeded:
+			return nil
 
 		case msg, ok := <-delivery:
 			if !ok {
@@ -387,7 +393,7 @@ func (c *AbstractConsumer[JobType]) Run() error {
 					return errors.Wrap(err, "failed to publish delayed message")
 				}
 
-				if ackErr := msg.Ack(false); ackErr != nil {
+				if err := msg.Ack(false); err != nil {
 					return errors.Wrap(err, "failed to ack message")
 				}
 			}
