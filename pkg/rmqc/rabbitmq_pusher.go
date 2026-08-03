@@ -2,9 +2,9 @@ package rmqc
 
 import (
 	"encoding/json"
-	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 )
 
 type Pusher struct {
@@ -32,6 +32,8 @@ type Pusher struct {
 	queueBindKey    string
 	queueBindNoWait bool
 	queueBindArgs   amqp.Table
+
+	logger *zap.Logger
 }
 
 type PusherOption func(*Pusher)
@@ -126,6 +128,12 @@ func WithPusherQueueBindArgs(queueBindArgs amqp.Table) PusherOption {
 	}
 }
 
+func WithPusherLogger(logger *zap.Logger) PusherOption {
+	return func(c *Pusher) {
+		c.logger = logger
+	}
+}
+
 func NewPusher(dsn string, options ...PusherOption) Pusher {
 	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
 
@@ -136,6 +144,7 @@ func NewPusher(dsn string, options ...PusherOption) Pusher {
 		queueName:       queueName,
 		exchangeDurable: true,
 		queueDurable:    true,
+		logger:          zap.Must(zap.NewDevelopment()),
 	}
 
 	for _, option := range options {
@@ -150,11 +159,21 @@ func (c *Pusher) Push(job any) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			c.logger.Error("failed to close connection", zap.Error(err))
+		}
+	}()
 
 	channel, err := connection.Channel()
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	defer func() {
+		if err := channel.Close(); err != nil {
+			c.logger.Error("failed to close channel", zap.Error(err))
+		}
+	}()
 
 	err = channel.ExchangeDeclare(
 		c.exchangeName,
@@ -192,36 +211,14 @@ func (c *Pusher) Push(job any) error {
 		return errors.WithStack(err)
 	}
 
-	var multiErr *multierror.Error
-
 	body, err := json.Marshal(job)
-	if err == nil {
-		err = channel.Publish(
-			c.exchangeName,
-			c.queueBindKey,
-			false,
-			false,
-			amqp.Publishing{ContentType: JsonContentType, Body: body},
-		)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-		}
-	} else {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = channel.Close()
 	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
+		return errors.Wrap(err, "failed to marshal job")
 	}
 
-	err = connection.Close()
+	err = publish(channel, body, c.exchangeName, c.queueBindKey, nil)
 	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	if multiErr != nil {
-		return errors.WithStack(multiErr)
+		return errors.Wrap(err, "failed to publish job")
 	}
 
 	return nil

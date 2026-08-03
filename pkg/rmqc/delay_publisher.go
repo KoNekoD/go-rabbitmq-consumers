@@ -1,13 +1,13 @@
 package rmqc
 
 import (
-	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -27,6 +27,8 @@ type DelayPublisher struct {
 
 	exchangeDurable bool
 	queueDurable    bool
+
+	logger *zap.Logger
 }
 
 type DelayPublisherOption func(*DelayPublisher)
@@ -41,6 +43,7 @@ func NewDelayPublisher(dsn string, opts ...DelayPublisherOption) *DelayPublisher
 		exchangeArgs:     nil,
 		exchangeDurable:  true,
 		queueDurable:     true,
+		logger:           zap.Must(zap.NewDevelopment()),
 	}
 
 	for _, o := range opts {
@@ -81,36 +84,50 @@ func WithDelayQueueDurable(v bool) DelayPublisherOption {
 	return func(p *DelayPublisher) { p.queueDurable = v }
 }
 
+func WithDelayLogger(logger *zap.Logger) DelayPublisherOption {
+	return func(p *DelayPublisher) { p.logger = logger }
+}
+
 func (p *DelayPublisher) PublishDelayedJSON(
-	ctx context.Context,
 	originalExchange string,
 	originalRoutingKey string,
-	payload any,
-	delayMs int,
+	body []byte,
+	delayMs int32,
 	headers amqp.Table,
 ) error {
 	if delayMs < 0 {
 		delayMs = 0
 	}
 
-	body, err := json.Marshal(payload)
+	connection, err := amqp.Dial(p.dsn)
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			p.logger.Error("failed to close connection", zap.Error(err))
+		}
+	}()
 
-	conn, err := amqp.Dial(p.dsn)
+	channel, err := connection.Channel()
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		if err := channel.Close(); err != nil {
+			p.logger.Error("failed to close channel", zap.Error(err))
+		}
+	}()
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	defer func() { _ = ch.Close() }()
-
-	err = ch.ExchangeDeclare(p.exchangeName, p.exchangeKind, p.exchangeDurable, false, false, false, p.exchangeArgs)
+	err = channel.ExchangeDeclare(
+		p.exchangeName,
+		p.exchangeKind,
+		p.exchangeDurable,
+		false,
+		false,
+		false,
+		p.exchangeArgs,
+	)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -118,35 +135,32 @@ func (p *DelayPublisher) PublishDelayedJSON(
 	delayQueueName := p.makeDelayQueueName(originalExchange, originalRoutingKey, delayMs)
 	delayRoutingKey := delayQueueName
 
-	ttl := int32(delayMs)
-	expires := int32(delayMs + int(p.queueExpireGrace.Milliseconds()))
+	ttl := delayMs
+	expires := delayMs + int32(p.queueExpireGrace.Milliseconds())
 	if expires < ttl+1000 {
 		expires = ttl + 1000
 	}
 
-	args := amqp.Table{
-		"x-message-ttl":             ttl,
-		"x-dead-letter-exchange":    originalExchange,
-		"x-dead-letter-routing-key": originalRoutingKey,
-		"x-expires":                 expires,
-	}
+	var args amqp.Table
 	for k, v := range p.queueArgs {
 		args[k] = v
 	}
+	args["x-message-ttl"] = ttl
+	args["x-dead-letter-exchange"] = originalExchange
+	args["x-dead-letter-routing-key"] = originalRoutingKey
+	args["x-expires"] = expires
 
-	_, err = ch.QueueDeclare(delayQueueName, p.queueDurable, false, false, false, args)
+	_, err = channel.QueueDeclare(delayQueueName, p.queueDurable, false, false, false, args)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	err = ch.QueueBind(delayQueueName, delayRoutingKey, p.exchangeName, false, nil)
+	err = channel.QueueBind(delayQueueName, delayRoutingKey, p.exchangeName, false, nil)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	pub := amqp.Publishing{ContentType: "application/json", Body: body, Headers: headers, Timestamp: time.Now()}
-
-	err = ch.PublishWithContext(ctx, p.exchangeName, delayRoutingKey, false, false, pub)
+	err = publish(channel, body, p.exchangeName, delayRoutingKey, headers)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -156,7 +170,7 @@ func (p *DelayPublisher) PublishDelayedJSON(
 
 var nonSafe = regexp.MustCompile(`[^a-zA-Z0-9_.:-]+`)
 
-func (p *DelayPublisher) makeDelayQueueName(exchangeName, routingKey string, delayMs int) string {
+func (p *DelayPublisher) makeDelayQueueName(exchangeName, routingKey string, delayMs int32) string {
 	name := fmt.Sprintf("delay_%s_%s_%d_delay", exchangeName, routingKey, delayMs)
 
 	safe := nonSafe.ReplaceAllString(name, "_")

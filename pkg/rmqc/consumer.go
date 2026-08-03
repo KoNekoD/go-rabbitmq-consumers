@@ -1,15 +1,14 @@
 package rmqc
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.uber.org/zap"
 )
 
 type AbstractConsumer[JobType any] struct {
@@ -45,7 +44,6 @@ type AbstractConsumer[JobType any] struct {
 
 	/** Consumer */
 	consumerTag      string
-	consumeAutoAck   bool
 	consumeExclusive bool
 	consumeNoLocal   bool
 	consumeNoWait    bool
@@ -54,11 +52,13 @@ type AbstractConsumer[JobType any] struct {
 	/** Handle Functions */
 	handleFunc func(JobType) error
 
+	stopOnce   *sync.Once
 	stopNeeded chan struct{}
 
 	baseDelay      time.Duration
 	maxDelay       time.Duration
 	delayPublisher *DelayPublisher
+	logger         *zap.Logger
 }
 
 type NewOption[JobType any] func(*AbstractConsumer[JobType])
@@ -159,12 +159,6 @@ func WithConsumerTag[JobType any](consumerTag string) NewOption[JobType] {
 	}
 }
 
-func WithConsumeAutoAck[JobType any](consumeAutoAck bool) NewOption[JobType] {
-	return func(c *AbstractConsumer[JobType]) {
-		c.consumeAutoAck = consumeAutoAck
-	}
-}
-
 func WithConsumeExclusive[JobType any](consumeExclusive bool) NewOption[JobType] {
 	return func(c *AbstractConsumer[JobType]) {
 		c.consumeExclusive = consumeExclusive
@@ -207,13 +201,19 @@ func WithQosGlobal[JobType any](qosGlobal bool) NewOption[JobType] {
 	}
 }
 
+func WithLogger[JobType any](logger *zap.Logger) NewOption[JobType] {
+	return func(c *AbstractConsumer[JobType]) {
+		c.logger = logger
+	}
+}
+
 func NewAbstractConsumer[JobType any](
 	dsn string,
 	options ...any,
-) AbstractConsumer[JobType] {
+) *AbstractConsumer[JobType] {
 	cleanDsn, queueName := unwrapQueueFromDSN(dsn)
 
-	c := AbstractConsumer[JobType]{
+	c := &AbstractConsumer[JobType]{
 		dsn:             cleanDsn,
 		exchangeName:    queueName,
 		exchangeKind:    ExchangeFanout,
@@ -221,11 +221,13 @@ func NewAbstractConsumer[JobType any](
 		consumerTag:     queueName,
 		prefetchCount:   1,
 		stopNeeded:      make(chan struct{}, 1),
+		stopOnce:        &sync.Once{},
 		baseDelay:       5 * time.Second,
 		maxDelay:        10 * time.Minute,
 		delayPublisher:  NewDelayPublisher(cleanDsn),
 		exchangeDurable: true,
 		queueDurable:    true,
+		logger:          zap.Must(zap.NewDevelopment()),
 	}
 
 	for _, option := range options {
@@ -233,7 +235,7 @@ func NewAbstractConsumer[JobType any](
 		case DelayPublisherOption:
 			option(c.delayPublisher)
 		case NewOption[JobType]:
-			option(&c)
+			option(c)
 		default:
 			panic(fmt.Errorf("invalid option type: %T", option))
 		}
@@ -256,21 +258,31 @@ func (c *AbstractConsumer[JobType]) SetHandleFunc(handleFunc func(JobType) error
 }
 
 type Consumer[JobType any] interface {
-	Init() error
+	Run() error
 	Stop()
 	Handle(JobType) error
 }
 
-func (c *AbstractConsumer[JobType]) Init() error {
+func (c *AbstractConsumer[JobType]) Run() error {
 	connection, err := amqp.Dial(c.dsn)
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	defer func() {
+		if err := connection.Close(); err != nil {
+			c.logger.Error("failed to close connection", zap.Error(err))
+		}
+	}()
 
 	channel, err := connection.Channel()
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	defer func() {
+		if err := channel.Close(); err != nil {
+			c.logger.Error("failed to close channel", zap.Error(err))
+		}
+	}()
 
 	err = channel.ExchangeDeclare(
 		c.exchangeName,
@@ -320,7 +332,7 @@ func (c *AbstractConsumer[JobType]) Init() error {
 	delivery, err := channel.Consume(
 		c.queueName,
 		c.consumerTag,
-		c.consumeAutoAck,
+		false, // manual internal control
 		c.consumeExclusive,
 		c.consumeNoLocal,
 		c.consumeNoWait,
@@ -329,97 +341,60 @@ func (c *AbstractConsumer[JobType]) Init() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-
-	var multiErr *multierror.Error
-
-	stopNeeded := false
-	mu := sync.Mutex{}
-	go func() {
-		<-c.stopNeeded
-
-		mu.Lock()
-
-		stopNeeded = true
-
-		err = channel.Cancel(c.consumerTag, false)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+	defer func() {
+		if err := channel.Cancel(c.consumerTag, false); err != nil {
+			c.logger.Error("failed to cancel consumer", zap.Error(err))
 		}
-
-		mu.Unlock()
 	}()
 
-	for msg := range delivery {
-		mu.Lock()
-
-		if stopNeeded {
-			break
-		}
-
+	handleMsg := func(msg amqp.Delivery) error {
 		var job JobType
 
-		err = json.Unmarshal(msg.Body, &job)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-			break
+		if err := json.Unmarshal(msg.Body, &job); err != nil {
+			return errors.Wrap(err, "failed to unmarshal message body")
 		}
 
-		err = c.handleFunc(job)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
+		if err := c.handleFunc(job); err != nil {
+			return errors.Wrap(err, "failed to handle job")
+		}
 
-			ctx := context.Background()
-			attempt := getRetryAttempt(msg.Headers) + 1
-			h := setRetryAttempt(msg.Headers, attempt)
-			delayMs := int(exponentialBackoffDelay(attempt, c.baseDelay, c.maxDelay).Milliseconds())
+		if err := msg.Ack(false); err != nil {
+			return errors.Wrap(err, "failed to ack message")
+		}
 
-			pubErr := c.delayPublisher.PublishDelayedJSON(ctx, c.exchangeName, c.queueBindKey, job, delayMs, h)
-			if pubErr != nil {
-				multiErr = multierror.Append(multiErr, errors.WithStack(pubErr))
-				break
+		return nil
+	}
+
+	for {
+		select {
+		case <-c.stopNeeded:
+			return nil
+
+		case msg, ok := <-delivery:
+			if !ok {
+				return nil
 			}
 
-			if ackErr := msg.Ack(false); ackErr != nil {
-				multiErr = multierror.Append(multiErr, errors.WithStack(ackErr))
-				break
+			if err := handleMsg(msg); err != nil {
+				c.logger.Error("failed to handle message", zap.Error(err), zap.String("body", string(msg.Body)))
+
+				attempt := getRetryAttempt(msg.Headers) + 1
+				h := headersWithRetryAttempt(msg.Headers, attempt)
+				delayMs := int32(exponentialBackoffDelay(attempt, c.baseDelay, c.maxDelay).Milliseconds())
+
+				err := c.delayPublisher.PublishDelayedJSON(msg.Exchange, msg.RoutingKey, msg.Body, delayMs, h)
+				if err != nil {
+					return errors.Wrap(err, "failed to publish delayed message")
+				}
+
+				if ackErr := msg.Ack(false); ackErr != nil {
+					return errors.Wrap(err, "failed to ack message")
+				}
 			}
-
-			mu.Unlock()
-
-			break
 		}
-
-		err = msg.Ack(false)
-		if err != nil {
-			multiErr = multierror.Append(multiErr, errors.WithStack(err))
-			break
-		}
-
-		mu.Unlock()
 	}
-
-	err = channel.Cancel(c.consumerTag, false)
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = channel.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	err = connection.Close()
-	if err != nil {
-		multiErr = multierror.Append(multiErr, errors.WithStack(err))
-	}
-
-	if multiErr != nil {
-		return errors.WithStack(multiErr)
-	}
-
-	return nil
 }
 
 func (c *AbstractConsumer[JobType]) Stop() {
-	c.stopNeeded <- struct{}{}
+	c.stopOnce.Do(func() { close(c.stopNeeded) })
 }

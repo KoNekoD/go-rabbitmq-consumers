@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const exampleDsn = "amqp://guest:guest@localhost:5672/example"
+const exampleDsn = "amqp://guest:guest@localhost:5672/example_vhost/example_queue"
 
 type ExampleJob struct {
 	ID     int
