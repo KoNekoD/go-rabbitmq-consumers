@@ -141,7 +141,7 @@ func (p *DelayPublisher) PublishDelayedJSON(
 		expires = ttl + 1000
 	}
 
-	var args amqp.Table
+	args := make(amqp.Table, len(p.queueArgs)+4)
 	for k, v := range p.queueArgs {
 		args[k] = v
 	}
